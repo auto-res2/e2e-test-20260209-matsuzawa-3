@@ -6,7 +6,7 @@ model:
   device_map: auto
 dataset:
   name: gsm8k
-  split: validation
+  split: test
   subset_size: 200
   max_length: 512
   preprocessing:
