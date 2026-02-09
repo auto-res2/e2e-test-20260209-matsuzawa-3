@@ -1,0 +1,19 @@
+defaults:
+  - run: proposed-qwen3-8b-gsm8k
+  - _self_
+
+mode: full
+results_dir: results
+
+run_id: ""
+
+wandb:
+  entity: airas
+  project: 2026-02-09
+  mode: online
+
+method: ""
+model: {}
+dataset: {}
+training: {}
+optuna: {}

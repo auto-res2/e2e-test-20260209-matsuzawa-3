@@ -1,0 +1,54 @@
+run_id: proposed-qwen3-8b-gsm8k
+method: iWM-CoT (Interpreter-Grounded Working-Memory CoT selection)
+model:
+  name: Qwen3-8B (8B parameters)
+  dtype: bfloat16
+  device_map: auto
+dataset:
+  name: gsm8k
+  split: validation
+  subset_size: 200
+  max_length: 512
+  preprocessing:
+    normalize_answer: true
+training:
+  task_type: inference_only
+  learning_rate: 0.0
+  batch_size: 1
+  epochs: 0
+  optimizer: none
+  max_new_tokens: 256
+  temperature: 0.7
+  top_p: 0.95
+  K: 8
+  selection_score:
+    alpha: 0.8
+    gamma: 1.2
+    delta: 0.2
+    beta: 0.002
+  constraints:
+    exec_safe_ops: true
+    informative_checks: true
+    answer_state_consistency: true
+optuna:
+  n_trials: 20
+  search_spaces:
+    - param_name: alpha
+      distribution_type: uniform
+      low: 0.0
+      high: 2.0
+    - param_name: gamma
+      distribution_type: uniform
+      low: 0.5
+      high: 3.0
+    - param_name: delta
+      distribution_type: uniform
+      low: 0.0
+      high: 1.0
+    - param_name: beta
+      distribution_type: loguniform
+      low: 0.0001
+      high: 0.01
+    - param_name: K
+      distribution_type: categorical
+      choices: [4, 8]
