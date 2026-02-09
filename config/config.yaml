@@ -4,6 +4,7 @@ defaults:
 
 mode: full
 results_dir: results
+run: ""
 
 run_id: ""
 
