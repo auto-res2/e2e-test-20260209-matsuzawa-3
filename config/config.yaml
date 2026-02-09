@@ -1,5 +1,5 @@
 defaults:
-  - run: comparative-1-qwen3-8b-gsm8k
+  - runs: comparative-1-qwen3-8b-gsm8k
   - _self_
 
 mode: full
