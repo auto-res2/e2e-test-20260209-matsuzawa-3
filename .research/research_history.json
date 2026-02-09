@@ -962,5 +962,118 @@
     "experimental_code": "import re, ast, math, torch\nfrom dataclasses import dataclass\nfrom transformers import AutoTokenizer, AutoModelForCausalLM\n\n# ---------------- Safe OP/CHECK machinery ----------------\nALLOWED_EXPR = {\n    ast.Expression, ast.BinOp, ast.UnaryOp, ast.Compare, ast.BoolOp,\n    ast.Name, ast.Load, ast.Constant,\n    ast.Add, ast.Sub, ast.Mult, ast.Div, ast.FloorDiv, ast.Mod, ast.Pow,\n    ast.And, ast.Or, ast.Not,\n    ast.Eq, ast.NotEq, ast.Lt, ast.LtE, ast.Gt, ast.GtE,\n}\nALLOWED_STMT = {ast.Module, ast.Assign, ast.AugAssign, ast.Expr}\n\ndef _all_nodes_allowed(node, allowed):\n    for n in ast.walk(node):\n        if type(n) not in allowed and type(n) not in ALLOWED_EXPR:\n            return False\n        if isinstance(n, ast.Name) and n.id.startswith(\"__\"):\n            return False\n    return True\n\ndef safe_exec_op(op_line: str, env: dict):\n    \"\"\"Execute a single assignment like: x = x + 3 or x += 3.\"\"\"\n    try:\n        mod = ast.parse(op_line, mode=\"exec\")\n        if not _all_nodes_allowed(mod, ALLOWED_STMT):\n            return False\n        # enforce single statement, must be Assign or AugAssign\n        if len(mod.body) != 1 or not isinstance(mod.body[0], (ast.Assign, ast.AugAssign)):\n            return False\n        # enforce single target name\n        stmt = mod.body[0]\n        if isinstance(stmt, ast.Assign):\n            if len(stmt.targets) != 1 or not isinstance(stmt.targets[0], ast.Name):\n                return False\n            target = stmt.targets[0].id\n        else:\n            if not isinstance(stmt.target, ast.Name):\n                return False\n            target = stmt.target.id\n        if target.startswith(\"__\"):\n            return False\n        code = compile(mod, \"<op>\", \"exec\")\n        exec(code, {\"__builtins__\": {}}, env)\n        # keep env scalar-only (int/float/bool)\n        for k,v in list(env.items()):\n            if not isinstance(v, (int, float, bool)) or isinstance(v, bool) and k != \"answer\":\n                # allow bools rarely; prune others\n                if not isinstance(v, (int, float, bool)):\n                    env.pop(k, None)\n        return True\n    except Exception:\n        return False\n\ndef safe_eval_check(expr: str, env: dict):\n    try:\n        node = ast.parse(expr, mode=\"eval\")\n        if not _all_nodes_allowed(node, {ast.Expression}):\n            return None\n        val = eval(compile(node, \"<check>\", \"eval\"), {\"__builtins__\": {}}, dict(env))\n        return bool(val)\n    except Exception:\n        return None\n\ndef is_informative_check(expr: str):\n    \"\"\"Heuristic anti-tautology filter.\"\"\"\n    try:\n        node = ast.parse(expr, mode=\"eval\")\n    except Exception:\n        return False\n\n    names = [n.id for n in ast.walk(node) if isinstance(n, ast.Name)]\n    consts = [n.value for n in ast.walk(node) if isinstance(n, ast.Constant) and isinstance(n.value, (int,float))]\n    has_compare = any(isinstance(n, ast.Compare) for n in ast.walk(node))\n    if not names or not consts or not has_compare:\n        return False\n    # reject literal True/False\n    if isinstance(node.body, ast.Constant) and isinstance(node.body.value, bool):\n        return False\n    # reject syntactic x == x\n    for n in ast.walk(node):\n        if isinstance(n, ast.Compare) and len(n.ops) == 1 and isinstance(n.ops[0], ast.Eq):\n            if isinstance(n.left, ast.Name) and len(n.comparators)==1 and isinstance(n.comparators[0], ast.Name):\n                if n.left.id == n.comparators[0].id:\n                    return False\n    return True\n\n# ---------------- Scoring + generation ----------------\nFINAL_RE = re.compile(r\"FINAL\\s*:\\s*(-?\\d+)\")\n\n@dataclass\nclass WMStats:\n    passed: int = 0\n    failed: int = 0\n    unsafe: int = 0\n    exec_ok: int = 0\n    exec_fail: int = 0\n    answer_mismatch: int = 0\n\ndef parse_and_run_iwm(completion: str):\n    env = {}\n    st = WMStats()\n    final = None\n\n    for raw in completion.splitlines():\n        line = raw.strip()\n        if line.startswith(\"OP:\"):\n            ok = safe_exec_op(line[len(\"OP:\"):].strip(), env)\n            st.exec_ok += int(ok)\n            st.exec_fail += int(not ok)\n        elif line.startswith(\"CHECK:\"):\n            expr = line[len(\"CHECK:\"):].strip()\n            if not is_informative_check(expr):\n                st.unsafe += 1\n                continue\n            res = safe_eval_check(expr, env)\n            if res is True:\n                st.passed += 1\n            elif res is False:\n                st.failed += 1\n            else:\n                st.unsafe += 1\n        else:\n            m = FINAL_RE.search(line)\n            if m:\n                final = int(m.group(1))\n\n    if final is not None and isinstance(env.get(\"answer\", None), (int,float)):\n        if int(env[\"answer\"]) != int(final):\n            st.answer_mismatch += 1\n    return final, env, st\n\n@torch.no_grad()\ndef logp_completion(model, tok, prompt, completion):\n    enc = tok(prompt + completion, return_tensors=\"pt\").to(model.device)\n    input_ids = enc[\"input_ids\"]\n    attn = enc[\"attention_mask\"]\n    out = model(input_ids=input_ids, attention_mask=attn)\n    logits = out.logits[:, :-1]\n    target = input_ids[:, 1:]\n    logp = torch.log_softmax(logits, dim=-1)\n    token_logp = logp.gather(-1, target.unsqueeze(-1)).squeeze(-1)\n    p = tok(prompt, return_tensors=\"pt\")[\"input_ids\"].size(1)\n    return token_logp[0, p-1:].sum().item(), int(input_ids.size(1))\n\n@torch.no_grad()\ndef iwm_cot_solve(model, tok, question, K=8, alpha=0.8, delta=0.2, gamma=1.2, beta=0.002,\n                 temp=0.7, max_new=256):\n    prompt = (\n        \"Solve the word problem by updating a small working-memory with executable operations.\\n\"\n        \"After each reasoning step output EXACTLY these three lines:\\n\"\n        \"OP: <single python assignment or += over scalar variables, e.g., x = x + 3>\\n\"\n        \"CHECK: <boolean invariant using only current variables; must compare to a number>\\n\"\n        \"TEXT: <one short sentence>\\n\"\n        \"Maintain a variable named answer holding the final result.\\n\"\n        \"End with: FINAL: <integer>\\n\\n\"\n        f\"Q: {question}\\nA:\\n\"\n    )\n\n    best = None\n    best_score = -1e18\n    best_stats = None\n\n    for _ in range(K):\n        inps = tok(prompt, return_tensors=\"pt\").to(model.device)\n        gen = model.generate(\n            **inps,\n            do_sample=True,\n            temperature=temp,\n            top_p=0.95,\n            max_new_tokens=max_new,\n            pad_token_id=tok.eos_token_id,\n        )\n        full = tok.decode(gen[0], skip_special_tokens=True)\n        completion = full[len(prompt):]\n\n        lp, n_tok = logp_completion(model, tok, prompt, completion)\n        final, env, st = parse_and_run_iwm(completion)\n\n        S = (lp\n             + alpha * st.passed\n             + delta * st.exec_ok\n             - gamma * (st.failed + st.unsafe + st.exec_fail + st.answer_mismatch)\n             - beta * n_tok)\n\n        if S > best_score:\n            best_score, best, best_stats = S, completion, st\n\n    return best, best_score, best_stats\n\n# Smoke test\nif __name__ == \"__main__\":\n    model_name = \"mistralai/Mistral-7B-Instruct-v0.2\"  # change if needed\n    tok = AutoTokenizer.from_pretrained(model_name)\n    model = AutoModelForCausalLM.from_pretrained(model_name, torch_dtype=torch.float16, device_map=\"auto\")\n\n    q = \"Janet has 3 apples and buys 5 more. She eats 2. How many apples are left?\"\n    comp, score, st = iwm_cot_solve(model, tok, q, K=4)\n    print(comp)\n    print(\"stats:\", st, \"score:\", score)\n",
     "expected_result": "On GSM8K (200-example subset, K=8):\n- Vanilla CoT (1 sample): ~42% accuracy\n- Self-Consistency: ~45%\n- logP-length best-of-K: ~46%\n- StaR-CoT (state+assert): ~52% (as previously expected)\n- **iWM-CoT (ours)**: **~56%** (+4 over StaR-CoT, +11 over self-consistency).\n\nOn SVAMP (200 examples, transfer):\n- Self-Consistency: ~43%\n- StaR-CoT: ~47%\n- **iWM-CoT**: **~50%** (improved generalization due to grounded updates).\n\nRobustness (GSM8K→GSM8K+Distractors):\n- Self-Consistency drop: ~5–7 points\n- StaR-CoT drop: ~3–4 points\n- **iWM-CoT drop**: **~2–3 points**.\n\nMechanistic diagnostics:\n- iWM-CoT exec_success_rate: >0.85 of OP lines execute; informative_check_rate: >0.75.\n- Spearman ρ(passed_check_ratio, correctness): ~0.45–0.55 (higher than StaR-CoT) because tautological checks are filtered and state is interpreter-grounded.\n- Mean tokens: iWM-CoT ~10–20% lower than vanilla CoT (short OP/TEXT lines, fewer rambling explanations).",
     "expected_conclusion": "iWM-CoT makes CoT selection more reliable by **grounding the working-memory itself**: the model proposes *operations* while an external interpreter executes state updates, sharply limiting the model’s ability to fabricate intermediate values. Runner-enforced **informative invariants** further reduce reward hacking by disallowing tautological/low-information checks, yielding a step-level signal that correlates more strongly with correctness and supports robust best-of-K selection.\n\nAcademically, this advances CoT from “verifying self-described reasoning” to **verifying state transitions**, a closer analogue of human working-memory updates and metacognitive monitoring that can be cleanly ablated (OP expressivity, check informativeness, answer consistency). Socially, the resulting traces are more auditable and safer for high-stakes assistance (tutoring, clerical arithmetic, decision support), because intermediate computations are executable and reviewable rather than purely rhetorical."
+  },
+  "experimental_design": {
+    "experiment_summary": "Task: solve grade-school math word problems by generating a final integer answer. We compare inference-time reasoning/selection strategies that sample multiple candidate solution traces and choose one output.\n\nPurpose: test whether Interpreter-Grounded Working-Memory CoT selection (iWM-CoT) improves correctness and robustness vs a strong inference-only baseline by (a) forcing intermediate working-memory updates through an externally executed, safe assignment DSL, and (b) enforcing non-trivial (informative) invariant checks that are harder to game, then using these signals for best-of-K selection.\n\nWorkflow (per GSM8K example):\n1) Build a structured prompt that requires repeated triplets of lines: `OP:` (single safe Python assignment updating scalar state), `CHECK:` (boolean invariant), `TEXT:` (brief narration), ending with `FINAL: <int>`.\n2) Sample K candidate traces from the same base LLM (temperature/top-p) with max token budget.\n3) For each trace: parse OP/CHECK/FINAL; execute OP lines in a sandboxed interpreter to update an external `STATE` dict; evaluate CHECK lines only if they pass an AST-based “informativeness” filter; compute a scalar selection score S combining model log-probability, number of passed informative checks, execution success, and penalties for failed/unsafe checks, exec failures, answer-state mismatch, and length.\n4) Choose the trace with max score and return its `FINAL` integer as prediction.\n5) Compare against a baseline that samples K outputs with standard CoT prompting and chooses by majority vote on extracted final integers (self-consistency).\n\nScale fit to Runner (single NVIDIA H200 140GB VRAM, 240GB RAM):\n- Use a single 8B-parameter model in bf16 and run inference-only.\n- Evaluate on GSM8K validation split with two staged sizes to bound runtime:\n  • Pilot: first 200 validation problems for rapid iteration/tuning.\n  • Confirmatory: first 1,000 validation problems for final reporting.\n- Use K=8 samples per problem (can be reduced to K=4 for quick debug), max_new_tokens=256, and sequential generation per example (low memory footprint; throughput fits H200).\n- Optional Optuna tunes only selection weights (α, γ, δ, β) on a held-out subset of the 200-pilot set to avoid overfitting and keep compute manageable.",
+    "runner_config": {
+      "runner_label": [
+        "self-hosted",
+        "gpu-runner"
+      ],
+      "description": "NVIDIA H200, VRAM: 140 GB, RAM: 240 GB"
+    },
+    "evaluation_metrics": [
+      {
+        "name": "accuracy",
+        "description": "Correctness criteria: A prediction is correct if the extracted final integer equals the gold GSM8K integer answer after numeric normalization.\n\nNormalization: extract the last integer appearing after a pattern like `#### <int>` in the gold solution (GSM8K standard), and extract the model’s final integer from `FINAL: <int>` (iWM-CoT) or from the last integer in the baseline completion (self-consistency candidates). Strip commas and whitespace; allow leading minus.\n\nCalculation method: accuracy = (#correct predictions) / (N evaluated problems).\n\nTask appropriateness: GSM8K is an arithmetic word-problem benchmark with a single correct integer answer; exact integer match reflects task success.\n\nRelevant visualizations:\n- Bar chart with 95% bootstrap confidence intervals for accuracy by method.\n- Per-example outcome scatter (method A correct vs method B correct) or Venn-style overlap counts (both correct / only iWM-CoT / only baseline / neither)."
+      },
+      {
+        "name": "exec_success_rate",
+        "description": "Correctness criteria: Measures whether the model can consistently produce executable OP lines under the restricted DSL.\n\nCalculation method:\n- For each sampled trace, let exec_ok be the count of OP lines that execute successfully in the sandbox, and exec_total be the count of parsed OP lines.\n- Define trace_exec_success = exec_ok / max(exec_total, 1).\n- Report exec_success_rate as the mean trace_exec_success across selected traces (and optionally across all sampled traces).\n\nTask appropriateness: iWM-CoT relies on executable grounded updates; failures indicate the model is not complying with the key constraint, limiting the method’s applicability.\n\nRelevant visualizations:\n- Histogram of trace_exec_success.\n- Box/violin plot of trace_exec_success grouped by whether the final answer is correct."
+      },
+      {
+        "name": "informative_check_rate",
+        "description": "Correctness criteria: A CHECK is “informative” if it passes runner-enforced AST constraints:\n- references ≥1 state variable name AND ≥1 numeric constant;\n- contains a relational operator (==,!=,<,<=,>,>=) via an AST Compare node;\n- is not a literal True/False;\n- is not syntactic tautology like `x == x`.\n\nCalculation method:\n- For each trace, let informative_total be number of CHECK lines; let informative_ok be number that pass the informativeness filter.\n- informative_check_rate = mean over traces of (informative_ok / max(informative_total, 1)).\nAdditionally report unsafe_check_rate = 1 − informative_check_rate.\n\nTask appropriateness: The hypothesis claims non-trivial checks reduce reward hacking; this metric quantifies compliance and the feasible signal volume.\n\nRelevant visualizations:\n- Stacked bar chart (passed/failed/unsafe checks) averaged per trace.\n- Scatter plot: informative_ok vs final correctness (0/1) with a fitted logistic curve."
+      },
+      {
+        "name": "check_correctness_spearman_rho",
+        "description": "Correctness criteria: Quantifies whether the passed-check signal is actually predictive of correctness (i.e., not gameable).\n\nCalculation method:\n- For each selected trace i, compute passed_ratio_i = passed_checks_i / max(informative_checks_i, 1), where passed_checks counts informative checks that evaluate True.\n- Let y_i be binary correctness (1 if final answer correct, else 0).\n- Compute Spearman’s rank correlation ρ between {passed_ratio_i} and {y_i}. Report ρ and a p-value via permutation test or asymptotic approximation.\n\nTask appropriateness: The method’s selection score uses passed checks; this metric tests whether that signal aligns with correctness.\n\nRelevant visualizations:\n- Scatter/strip plot of passed_ratio for correct vs incorrect traces.\n- Reliability curve: bin traces by passed_ratio deciles and plot empirical correctness per bin."
+      },
+      {
+        "name": "mean_tokens_generated",
+        "description": "Correctness criteria: Not a correctness metric; an efficiency metric to ensure gains are not solely due to longer outputs.\n\nCalculation method:\n- For each selected trace, count generated tokens (excluding prompt tokens) using the model tokenizer.\n- mean_tokens_generated = average over N selected traces.\nOptionally also report total_tokens = prompt_tokens + generated_tokens.\n\nTask appropriateness: iWM-CoT claims compact, auditable traces; token usage proxies latency/cost.\n\nRelevant visualizations:\n- Box plot of generated token counts by method.\n- Scatter plot of token count vs correctness."
+      }
+    ],
+    "models_to_use": [
+      "Qwen3-8B (8B parameters)"
+    ],
+    "datasets_to_use": [
+      "gsm8k"
+    ],
+    "proposed_method": {
+      "method_name": "iWM-CoT (Interpreter-Grounded Working-Memory CoT selection)",
+      "description": "Inference-only best-of-K decoding framework that forces intermediate reasoning to occur via externally executed working-memory updates in a restricted assignment DSL (`OP:` lines), plus runner-enforced informative invariant checks (`CHECK:` lines). Candidate traces are scored using a combination of model log-probability, number of passed informative checks, execution success, and penalties for unsafe/failed checks, execution failures, length, and answer-state mismatch (when `answer` is maintained). This grounds *state evolution* rather than trusting model-written state text, reducing gameability of self-generated checks.",
+      "optuna_config": {
+        "enabled": true,
+        "n_trials": 20,
+        "search_spaces": [
+          {
+            "param_name": "alpha",
+            "distribution_type": "uniform",
+            "low": 0.0,
+            "high": 2.0
+          },
+          {
+            "param_name": "gamma",
+            "distribution_type": "uniform",
+            "low": 0.5,
+            "high": 3.0
+          },
+          {
+            "param_name": "delta",
+            "distribution_type": "uniform",
+            "low": 0.0,
+            "high": 1.0
+          },
+          {
+            "param_name": "beta",
+            "distribution_type": "loguniform",
+            "low": 0.0001,
+            "high": 0.01
+          },
+          {
+            "param_name": "K",
+            "distribution_type": "categorical",
+            "choices": [
+              4,
+              8
+            ]
+          }
+        ]
+      }
+    },
+    "comparative_methods": [
+      {
+        "method_name": "Self-Consistency CoT (majority vote over K samples)",
+        "description": "Inference-only baseline: prompt the model with a standard chain-of-thought instruction (free-form reasoning), sample K completions (same decoding settings), extract a final integer answer from each completion, and predict by majority vote (ties broken by highest average log-probability among tied answers). Tests whether iWM-CoT’s grounded state transitions/checks improve over a strong sampling-based method without any external interpreter constraints.",
+        "optuna_config": {
+          "enabled": true,
+          "n_trials": 20,
+          "search_spaces": [
+            {
+              "param_name": "K",
+              "distribution_type": "categorical",
+              "choices": [
+                4,
+                8,
+                16
+              ]
+            },
+            {
+              "param_name": "temperature",
+              "distribution_type": "uniform",
+              "low": 0.3,
+              "high": 1.0
+            },
+            {
+              "param_name": "top_p",
+              "distribution_type": "uniform",
+              "low": 0.8,
+              "high": 1.0
+            }
+          ]
+        }
+      }
+    ]
   }
 }
