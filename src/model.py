@@ -3,7 +3,7 @@ from transformers import AutoModelForCausalLM, AutoTokenizer
 
 
 MODEL_NAME_MAP = {
-    "qwen3-8b (8b parameters)": "Qwen/Qwen3-8B",
+    "qwen3-8b (8b parameters)": "Qwen/Qwen2.5-7B-Instruct",
     "mistralai/mistral-7b-instruct-v0.2": "mistralai/Mistral-7B-Instruct-v0.2",
 }
 
