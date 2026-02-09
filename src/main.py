@@ -23,16 +23,20 @@ def main(cfg):
 
     run_id = cfg.run_id
 
+    # Get the absolute path to the project root and train.py
+    project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    train_script = os.path.join(project_root, "src", "train.py")
+    
     cmd = [
         sys.executable,
-        "-m",
-        "src.train",
+        train_script,
         f"run={run_id}",
         f"results_dir={cfg.results_dir}",
         f"mode={cfg.mode}",
     ]
     env = os.environ.copy()
     env["HYDRA_FULL_ERROR"] = "1"
+    env["PYTHONPATH"] = project_root + os.pathsep + env.get("PYTHONPATH", "")
     subprocess.run(cmd, check=True, env=env)
 
 

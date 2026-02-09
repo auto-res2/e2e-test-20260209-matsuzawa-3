@@ -14,8 +14,12 @@ from scipy.stats import spearmanr
 from torch.utils.data import DataLoader
 import wandb
 
-from .preprocess import build_dataset
-from .model import load_model_and_tokenizer
+try:
+    from .preprocess import build_dataset
+    from .model import load_model_and_tokenizer
+except ImportError:
+    from preprocess import build_dataset
+    from model import load_model_and_tokenizer
 
 FINAL_RE = re.compile(r"FINAL\s*:\s*(-?\d+)")
 
