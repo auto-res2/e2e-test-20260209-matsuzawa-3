@@ -299,6 +299,11 @@ def evaluate_run(cfg, model, tok, dataloader, log_wandb: bool = True, max_steps:
             break
         question = batch["question"][0]
         gold = batch["gold"][0]
+        
+        # Convert gold to int if it's a numpy/torch type
+        if hasattr(gold, 'item'):
+            gold = gold.item()
+        gold = int(gold)
 
         if step == 0:
             assert isinstance(question, str), "Question must be a string"
