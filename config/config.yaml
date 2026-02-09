@@ -1,20 +1,40 @@
-defaults:
-  - run: comparative-1-qwen3-8b-gsm8k
-  - _self_
-
 mode: full
 results_dir: results
-run: ""
+run: comparative-1-qwen3-8b-gsm8k
 
-run_id: ""
+run_id: comparative-1-qwen3-8b-gsm8k
 
 wandb:
   entity: airas
   project: 2026-02-09
   mode: online
 
-method: ""
-model: {}
-dataset: {}
-training: {}
-optuna: {}
+method: iWM-CoT
+
+model:
+  name: qwen3-8b (8b parameters)
+  dtype: bfloat16
+  device_map: auto
+
+dataset:
+  name: gsm8k
+  split: test
+  subset_size: null
+
+training:
+  K: 5
+  temperature: 0.8
+  top_p: 0.95
+  max_new_tokens: 512
+  selection_score:
+    alpha: 1.0
+    beta: 0.001
+    gamma: 5.0
+    delta: 0.5
+  constraints:
+    informative_checks: true
+    answer_state_consistency: true
+
+optuna:
+  n_trials: 0
+  search_spaces: []
