@@ -14,7 +14,6 @@ method: iWM-CoT
 model:
   name: qwen3-8b (8b parameters)
   dtype: bfloat16
-  device_map: auto
 
 dataset:
   name: gsm8k

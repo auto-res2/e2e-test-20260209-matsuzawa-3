@@ -22,7 +22,6 @@ def load_model_and_tokenizer(cfg):
     model = AutoModelForCausalLM.from_pretrained(
         model_name,
         torch_dtype=dtype,
-        device_map=cfg.model.device_map,
         cache_dir=".cache/",
     )
     model.eval()
